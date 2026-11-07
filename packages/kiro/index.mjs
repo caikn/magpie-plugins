@@ -21,7 +21,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto"
 import { execFile } from "node:child_process"
 import { existsSync, statSync } from "node:fs"
 import { readFile, rename, writeFile } from "node:fs/promises"
-import { homedir, hostname } from "node:os"
+import { homedir, hostname, platform, release } from "node:os"
 import { delimiter, join } from "node:path"
 
 const ID = "kiro"
@@ -40,7 +40,10 @@ const CALLBACK_PORTS = [3128, 4649, 6588, 8008, 9091, 49153, 50153, 51153, 52153
 const SCOPES = ["codewhisperer:completions", "codewhisperer:analysis", "codewhisperer:conversations",
   "codewhisperer:transformations", "codewhisperer:taskassist"]
 // how the IDE names itself to Kiro's auth service, and when refreshing
-const IDE_UA = "KiroIDE-1.1.70-" + createHash("sha256").update("magpie:" + hostname()).digest("hex")
+// MACHINE_ID stands where the IDE puts its machine id (node-machine-id's
+// sha256): one per install, the same on every call.
+const MACHINE_ID = createHash("sha256").update("magpie:" + hostname()).digest("hex")
+const IDE_UA = "KiroIDE-1.1.70-" + MACHINE_ID
 const DESKTOP_UA = "Kiro-Desktop/0.2.13 (darwin; arm64)"
 const SIGN_IN_TIMEOUT = 10 * 60 * 1000
 // A Builder ID sign-in has no profile of its own, and Kiro won't list one
@@ -704,7 +707,7 @@ function account(client) {
       // kiro-cli names no profile in an API key's calls, even one GetProfile
       // found; the profile only says the key's region
       const profile = c.method === "apikey" ? "" : c.profile
-      const a = { token: c.access, tokenType: tokenType(c), profile, region: regionOf(c.profile, c.region) }
+      const a = { token: c.access, tokenType: tokenType(c), idc: c.method === "idc", profile, region: regionOf(c.profile, c.region) }
       if (!twoRegions(c) || st.builderID || !c.profiles) return a
       // the first enabled region with credits left, in CREDIT_REGIONS' order
       const now = Date.now()
@@ -1067,14 +1070,14 @@ function inputSchema(s) {
 
 // buildKiro is the body of a generateAssistantResponse call, as it is
 // before its images are fitted (kiroBody).
-function buildKiro(req, model, profile, budget) {
-  return JSON.stringify(kiroRequest(req, model, profile, budget))
+function buildKiro(req, model, profile, budget, conversation) {
+  return JSON.stringify(kiroRequest(req, model, profile, budget, conversation))
 }
 
 // kiroBody is the body sent: buildKiro's, with every image it keeps under
 // Kiro's size limit.
-async function kiroBody(req, model, profile, budget) {
-  return JSON.stringify(await fitImages(kiroRequest(req, model, profile, budget)))
+async function kiroBody(req, model, profile, budget, conversation) {
+  return JSON.stringify(await fitImages(kiroRequest(req, model, profile, budget, conversation)))
 }
 
 // UNDERSTOOD is the reply Kiro IDE puts in its history where a turn has
@@ -1105,7 +1108,7 @@ function contextFirst(messages) {
   return [...messages.slice(0, start), ...context.map((m) => ({ ...m, role: "user" })), { role: "assistant", content: UNDERSTOOD }, ...turn]
 }
 
-function kiroRequest(req, model, profile, budget) {
+function kiroRequest(req, model, profile, budget, conversation) {
   const entries = []
   // the messages the caller marked for its prompt cache (cache_control),
   // which go to Kiro as a cachePoint on the message they end up in (#110)
@@ -1113,7 +1116,7 @@ function kiroRequest(req, model, profile, budget) {
   const mark = (msg, parts) => {
     if (parts.some((p) => p?.cache_control)) marked.add(msg)
   }
-  const user = () => ({ content: "", modelId: model, origin: "KIRO_CLI" })
+  const user = () => ({ content: "", modelId: model, origin: "AI_EDITOR" })
   const resultsOnly = new WeakSet() // the messages made to carry a reply's web search results
   for (const m of contextFirst(req.messages ?? [])) {
     const parts = typeof m.content === "string" ? [{ type: "text", text: m.content }] : m.content ?? []
@@ -1294,35 +1297,141 @@ function kiroRequest(req, model, profile, budget) {
   }
   for (const drop of points.slice(0, Math.max(0, points.length - 4))) drop()
 
-  const state = { chatTriggerType: "MANUAL", agentTaskType: "vibe", conversationId: randomUUID(), currentMessage: { userInputMessage: current } }
+  const state = { chatTriggerType: "MANUAL", agentTaskType: "vibe", conversationId: conversationID(conversation), currentMessage: { userInputMessage: current } }
   if (entries.length > 1) state.history = entries.slice(0, -1)
-  const out = { conversationState: state, agentMode: "vibe" }
+  // the agent mode goes as a header (x-amzn-kiro-agent-mode), as the IDE's
+  // client binds it, not in the body
+  const out = { conversationState: state }
   if (profile) out.profileArn = profile
   if (native) out.additionalModelRequestFields = native
   return out
 }
 
-// sdkHeaders are the AWS SDK's headers on a call to Kiro's runtime, as
-// kiro-cli's client sends them: who is calling, and as which client.
-function sdkHeaders(a) {
-  const ua = `aws-sdk-rust/1.0.0 ua/2.1 os/other lang/rust api/codewhispererstreaming#1.28.3 m/E app/AmazonQ-For-CLI md/appVersion-1.28.3-${randomUUID().replaceAll("-", "")}`
-  return {
-    ...authHeaders(a),
-    "amz-sdk-invocation-id": randomUUID(),
-    "amz-sdk-request": "attempt=1; max=1",
-    "x-amz-user-agent": ua,
-    "User-Agent": ua,
-  }
+// conversationID is the conversationId of a chat call. The IDE keeps one
+// for a whole conversation; the plugin keeps one for the caller's session
+// (magpie's X-Magpie-Conversation), the same id on each turn of it, and a
+// new one when it can't tell the session.
+function conversationID(key) {
+  if (!key) return randomUUID()
+  const h = createHash("sha256").update("kiro-conversation:" + key).digest("hex")
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-4${h.slice(13, 16)}-${"89ab"[parseInt(h[16], 16) & 3]}${h.slice(17, 20)}-${h.slice(20, 32)}`
 }
 
-function sendKiro(a, body, signal) {
+// the headers that name the caller's session, the first one sent
+const SESSION_HEADERS = ["x-magpie-conversation", "x-magpie-session", "x-opencode-session"]
+function sessionOf(input, init) {
+  const sets = [init?.headers, input instanceof Request ? input.headers : undefined]
+  for (const name of SESSION_HEADERS)
+    for (const h of sets) {
+      if (!h) continue
+      const v = h instanceof Headers ? h.get(name)
+        : Array.isArray(h) ? h.find(([k]) => k.toLowerCase() === name)?.[1]
+        : Object.entries(h).find(([k]) => k.toLowerCase() === name)?.[1]
+      if (v) return String(v)
+    }
+  return ""
+}
+
+// What Kiro IDE 1.4.121 (its agent, KAS 0.66.89, on Electron 44's Node
+// 24.22.1) sends on a chat call, read from the IDE's own extension.js. Its
+// KiroRuntime client (@amzn/kiro-runtime-service-typescript-client 1.0.0)
+// is the AWS SDK for JavaScript's: the SDK's user agent, m/N for the
+// endpoint the IDE names itself, then the IDE's own "KiroIDE <version>
+// <machine id>" with KAS/<version> and acp-client/kiro-ide, spaces made
+// "-". Its retry budget is 3 tries, said in amz-sdk-request and
+// x-amzn-kiro-attempt, which count up on each (see paced).
+const IDE_VERSION = "1.4.121"
+const IDE_KAS = "0.66.89"
+const IDE_NODE = "24.22.1"
+const IDE_APP = `KiroIDE-${IDE_VERSION}-${MACHINE_ID}-KAS/${IDE_KAS} acp-client/kiro-ide`
+const sdkPart = (s) => String(s).replace(/[^!$%&'*+\-.^_`|~\w#]/g, "-")
+const IDE_SDK_UA = `aws-sdk-js/1.0.0 ua/2.1 os/${sdkPart(platform())}#${sdkPart(release())} lang/js md/nodejs#${IDE_NODE} api/kiroruntime#1.0.0 m/N ${IDE_APP}`
+
+// sdkHeaders are the AWS SDK's headers on a call to Kiro's runtime, as the
+// Kiro IDE's client sends them: who is calling, and as which client. The
+// IDE names a Builder ID or Identity Center token's kind (SSO_OIDC) too.
+function sdkHeaders(a, attempt = 1, invocation = randomUUID()) {
+  const h = {
+    ...authHeaders(a),
+    "amz-sdk-invocation-id": invocation,
+    "amz-sdk-request": `attempt=${attempt}; max=${TRIES}`,
+    "x-amz-user-agent": `aws-sdk-js/1.0.0 ${IDE_APP}`,
+    "User-Agent": IDE_SDK_UA,
+    "x-amzn-kiro-client-attribution": "kiro-ide",
+  }
+  if (!a.tokenType && a.idc) h.tokentype = "SSO_OIDC"
+  return h
+}
+
+function sendKiro(a, body, signal, attempt = 1, invocation) {
   return fetch(runtime(a.region) + "/generateAssistantResponse", {
     method: "POST",
-    headers: { ...sdkHeaders(a), "x-amzn-codewhisperer-optout": "true", "x-amzn-kiro-agent-mode": "vibe",
-      "Content-Type": "application/json", Accept: "application/vnd.amazon.eventstream" },
+    headers: { ...sdkHeaders(a, attempt, invocation), "x-amzn-kiro-attempt": `${attempt};max=${TRIES}`, "x-amzn-codewhisperer-optout": "true",
+      "x-amzn-kiro-agent-mode": "vibe", "Content-Type": "application/json", Accept: "application/vnd.amazon.eventstream" },
     body,
     signal,
   })
+}
+
+// TRIES is the Kiro IDE's tries of one chat call (its QClientRetryStrategy,
+// agent 1.1.787, QAf), the first included.
+const TRIES = 3
+// PACE is the IDE's pause before the nth try after a throttle (its
+// throttling backoff: 1s doubling, 20% either way, at most 20s), unless
+// Kiro said how long (retryAfterMilliseconds and the like).
+const PACE = { base: 1000, jitter: 0.2, max: 20_000 }
+const paceOf = (n) => Math.min(PACE.max, PACE.base * 2 ** (n - 1)) * (1 - PACE.jitter + Math.random() * 2 * PACE.jitter)
+// THROTTLES are the reasons the IDE takes a 429 for a throttle it waits
+// out and tries again (its C1p and ServiceThrottleError): a throttle
+// Kiro gives no reason for is one too. A daily, monthly or usage limit
+// is not (usedUpSaid), nor is INSUFFICIENT_MODEL_CAPACITY.
+const THROTTLES = new Set(["USER_REQUEST_RATE_EXCEEDED", "CREDIT_CONSUMPTION_RATE_EXCEEDED", "SERVICE_REQUEST_RATE_EXCEEDED"])
+function throttleSaid(text) {
+  let e = {}
+  try {
+    e = JSON.parse(text) ?? {}
+  } catch {}
+  if (e.reason) return THROTTLES.has(e.reason)
+  return !usedUpSaid(text) && !/INSUFFICIENT_MODEL_CAPACITY/.test(text) && /too many requests|throttl/i.test(text)
+}
+
+// timing is how the plugin waits; tests make it instant.
+const timing = {
+  sleep: (ms, signal) =>
+    new Promise((resolve, reject) => {
+      if (signal?.aborted) return reject(aborted())
+      const t = setTimeout(() => {
+        signal?.removeEventListener("abort", stop)
+        resolve()
+      }, ms)
+      const stop = () => {
+        clearTimeout(t)
+        reject(aborted())
+      }
+      signal?.addEventListener("abort", stop, { once: true })
+    }),
+}
+
+// paced is sendKiro as the Kiro IDE sends a chat call: a 429 throttle is
+// waited out and tried again, up to TRIES in all, each try said in
+// amz-sdk-request and x-amzn-kiro-attempt under one invocation id. The
+// IDE answers its own USER_REQUEST_RATE_EXCEEDED so ("Retrying in N
+// seconds"), which is why a burst it rides out reached magpie's agent
+// as a 429 (onemezao on Discord). A wait Kiro says is longer than PACE.max
+// isn't held here: the 429 goes back with it, for magpie to rest the
+// account. The answer of the last try is the answer.
+async function paced(a, body, signal) {
+  const invocation = randomUUID()
+  for (let n = 1; ; n++) {
+    const res = await sendKiro(a, body, signal, n, invocation)
+    if (res.status !== 429 || n >= TRIES) return res
+    const text = (await res.text()).slice(0, 1 << 20)
+    const again = () => new Response(text, { status: res.status, statusText: res.statusText, headers: res.headers })
+    if (!throttleSaid(text)) return again()
+    const said = saidWait(res.headers, text)
+    if (said > PACE.max) return again()
+    await timing.sleep(said ?? paceOf(n), signal)
+  }
 }
 
 // tooLongSaid is whether Kiro's words say the conversation is past the
@@ -1399,6 +1508,14 @@ const requestID = (headers) => headers.get("x-amzn-requestid") || headers.get("x
 // seconds or as a date. Unsaid, magpie keeps to its own pauses, but for
 // an account's request rate (USER_RATE_WAIT).
 function waitOf(headers, body) {
+  let w = saidWait(headers, body)
+  if (w === undefined && String(body ?? "").includes(USER_RATE)) w = USER_RATE_WAIT
+  return w
+}
+
+// saidWait is the wait Kiro itself said, if any (waitOf, but none of
+// magpie's own).
+function saidWait(headers, body) {
   const ms = (v) => {
     const n = v == null || v === "" ? NaN : Number(v)
     return Number.isFinite(n) && n > 0 ? n : undefined
@@ -1413,7 +1530,6 @@ function waitOf(headers, body) {
     const secs = ms(ra)
     w = secs !== undefined ? secs * 1000 : ms(Date.parse(ra) - Date.now())
   }
-  if (w === undefined && String(body ?? "").includes(USER_RATE)) w = USER_RATE_WAIT
   return w
 }
 
@@ -1600,10 +1716,13 @@ async function* events(body, model, budget) {
         if (budget) yield* think.feed(text)
         else if (text) yield { kind: "text", text }
       } else if (kind === "reasoningContentEvent") {
+        // one event may carry the reasoning and its signature together (auto,
+        // called as the IDE): the signature goes on the block it ends
         if (m.text) {
           said += m.text.length
           yield { kind: "think", text: m.text }
-        } else if (m.signature) yield { kind: "sig", text: m.signature }
+        }
+        if (m.signature) yield { kind: "sig", text: m.signature }
       } else if (kind === "toolUseEvent") {
         if (m.toolUseId && m.toolUseId !== tool) {
           yield* think.end() // the text before a call is all said
@@ -2052,20 +2171,20 @@ function searchAnswer(text, hosted) {
 // refreshed, when Kiro turns the token down (403). As the built-in: no
 // credentials is a 401, a failed refresh after the 403 a 502; none marks
 // the account.
-async function generate(creds, auth, req, signal) {
+async function generate(creds, auth, req, signal, conversation) {
   const model = String(req.model ?? "auto")
   const budget = thinking(req, model)
   const hosted = hostedSearch(req)
   if (hosted?.error) return errorResponse(400, hosted.error)
-  const first = await ask(creds, auth, req, model, budget, signal)
+  const first = await ask(creds, auth, req, model, budget, signal, conversation)
   if (!first.res) return errorResponse(first.status, first.message, first.wait)
-  const it = hosted ? searching(creds, auth, req, model, budget, signal, hosted, first) : events(first.res.body, model, budget)
+  const it = hosted ? searching(creds, auth, req, model, budget, signal, hosted, first, conversation) : events(first.res.body, model, budget)
   return kept(await reply(it, model, req.stream === true, toolNames(req)))
 }
 
 // ask sends one turn to Kiro: { res, a }, a 200, or the { status, message }
 // of a failure.
-async function ask(creds, auth, req, model, budget, signal) {
+async function ask(creds, auth, req, model, budget, signal, conversation) {
   let a
   try {
     a = await creds(auth)
@@ -2074,7 +2193,7 @@ async function ask(creds, auth, req, model, budget, signal) {
   }
   let res
   try {
-    res = await sendKiro(a, await kiroBody(req, model, a.profile, budget), signal)
+    res = await paced(a, await kiroBody(req, model, a.profile, budget, conversation), signal)
   } catch (e) {
     if (e?.name === "AbortError") throw e
     return { status: 502, message: e.message }
@@ -2087,7 +2206,7 @@ async function ask(creds, auth, req, model, budget, signal) {
       return { status: 502, message: e.message }
     }
     try {
-      res = await sendKiro(a, await kiroBody(req, model, a.profile, budget), signal)
+      res = await paced(a, await kiroBody(req, model, a.profile, budget, conversation), signal)
     } catch (e) {
       if (e?.name === "AbortError") throw e
       return { status: 502, message: e.message }
@@ -2112,7 +2231,7 @@ async function ask(creds, auth, req, model, budget, signal) {
     if (tried.has(next.region)) return { status: 429, message: regionsUsedUp(next) + f.message, wait: f.wait }
     a = next
     try {
-      res = await sendKiro(a, await kiroBody(req, model, a.profile, budget), signal)
+      res = await paced(a, await kiroBody(req, model, a.profile, budget, conversation), signal)
     } catch (e) {
       if (e?.name === "AbortError") throw e
       return { status: 502, message: e.message }
@@ -2142,7 +2261,7 @@ const aborted = () => Object.assign(new Error("the request was cancelled"), { na
 // caller's (passed on as ever, the searches of its turn with it), or has
 // taken hosted.uses + 2 turns (pause_turn, which the caller may send back
 // to go on). Searches past hosted.uses are max_uses_exceeded.
-async function* searching(creds, auth, req, model, budget, signal, hosted, first) {
+async function* searching(creds, auth, req, model, budget, signal, hosted, first, conversation) {
   let { res, a } = first
   const messages = [...(req.messages ?? [])]
   const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reported: false, searches: 0 }
@@ -2254,7 +2373,7 @@ async function* searching(creds, auth, req, model, budget, signal, hosted, first
       return
     }
     messages.push({ role: "assistant", content: said })
-    const next = await ask(creds, auth, { ...req, messages }, model, budget, signal)
+    const next = await ask(creds, auth, { ...req, messages }, model, budget, signal, conversation)
     if (!next.res) {
       yield { kind: "error", status: next.status, text: `Kiro, after its web search: ${next.message} (${next.status})` }
       return
@@ -2598,7 +2717,7 @@ export async function KiroAuthPlugin({ client } = {}) {
             } catch {
               return errorResponse(400, "a request that isn't JSON")
             }
-            return generate(creds, (await getAuth()) ?? auth, req, init.signal)
+            return generate(creds, (await getAuth()) ?? auth, req, init.signal, sessionOf(input, init))
           },
         }
       },
@@ -2684,4 +2803,4 @@ export async function KiroAuthPlugin({ client } = {}) {
 }
 
 // for tests
-export const _internal = { generate, waitOf, refresh, usageOf, buildKiro, kiroBody, IMAGE_LIMIT, events, reply, failure, toolID, toolName, toolNames, thinking, nativeFields, listModels, contextFirst, configModel, runtimeModel, readCLI, readIDE, regionOf, planName, frames }
+export const _internal = { generate, waitOf, timing, TRIES, refresh, usageOf, buildKiro, kiroBody, IMAGE_LIMIT, events, reply, failure, toolID, toolName, toolNames, thinking, nativeFields, listModels, contextFirst, configModel, runtimeModel, readCLI, readIDE, regionOf, planName, frames }
